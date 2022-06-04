@@ -2,6 +2,13 @@ from dataclasses import dataclass
 from typing import ChainMap, Generator, Iterable, Mapping, List
 dataclass = dataclass(eq = True, frozen=True)
 
+# Term := Relation([Term]) | Var | Const
+# Predicate := Top | Just(Relation) | Conj(Predicate) | Disj(Predicate) | Not(Predicate)
+# Rule := Rule (Term Predicate)
+# Env := Mapping(Term Term)
+# TopLevel := [Rule]
+
+
 class Term: pass
 class Relation(Term): 
     def __init__(self, *args): self.data = args
