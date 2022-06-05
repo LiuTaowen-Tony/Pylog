@@ -1,5 +1,6 @@
 from dataclasses import dataclass
-from typing import ChainMap, Generator, Iterable, Mapping, List
+from typing import Mapping, List
+from uuid import uuid1
 dataclass = dataclass(eq = True, frozen=True)
 
 # Term := Relation([Term]) | Var | Const
@@ -8,122 +9,129 @@ dataclass = dataclass(eq = True, frozen=True)
 # Env := Mapping(Term Term)
 # TopLevel := [Rule]
 
-
 class Term: pass
 class Relation(Term): 
     def __init__(self, *args): self.data = args
     def __getitem__(self, idx): return self.data[idx]
     def __len__(self): return len(self.data)
     def __repr__(self): return str(self.data)
-
 @dataclass
 class Var(Term): x : object
 @dataclass
 class Const(Term): x : object
 
 class Predicate: pass
+
+class Top(Predicate): pass
+@dataclass
+class Not(Predicate): body : Predicate
+@dataclass
+class Conj(Predicate): clauses : List[Predicate]
+@dataclass
+class Disj(Predicate): clauses : List[Predicate]
+@dataclass
+class Just(Predicate): body : Relation
+
 @dataclass
 class Rule:
     term : Term
     body : Predicate
 
-class Top(Predicate): pass
-@dataclass
-class Not(Predicate): 
-    body : Predicate
-@dataclass
-class Conj(Predicate): 
-    clauses : List[Predicate]
-@dataclass
-class Disj(Predicate): 
-    clauses : List[Predicate]
-@dataclass
-class Just(Predicate):
-    body : Relation
+Env = Mapping[Term, Term]
+TopLevel = List[Rule]
+
+def changeName(r : Rule):
+    def helper(scheme : Mapping[Var, Var], pred : Predicate) -> Predicate :
+        match pred:
+            case Top():         return pred
+            case Not(body):     return Not(helper(scheme, body))
+            case Conj(clauses): return Conj([helper(scheme, i) for i in clauses])
+            case Disj(clauses): return Disj([helper(scheme, i) for i in clauses])
+            case Just(body):    return Just(Relation(*[
+                scheme[i] if i in scheme else i for i in body]))
+    match r.term:
+        case Relation():
+            vars    = filter(lambda x: isinstance(x, Var), r.term)
+            mapping = dict(zip(vars, (Var(uuid1()) for _ in vars)))
+            term    = Relation(*[mapping[i] if i in mapping else i for i in r.term])
+            return Rule(term, helper(mapping, r.body))
+        case Var(x): # kinda wired... 
+            y    = Var(uuid1())
+            return Rule(y, helper({Var(x) : y}, r.body))
+        case _ : return r
 
 # reduce a variable into a constant if it can be reduced in the env
-def walk(var : Term, env : Mapping):
+def walk(var : Term, env : Env):
     if isinstance(var, Var) and var in env: return walk(env[var], env)
     else:                                   return var
 
 # unify two terms
-def unify(u : Term, v : Term, env : Mapping = dict()) -> Mapping:
-    if env is None: return None
-    if isinstance(u, Relation) and isinstance(v, Relation):
-        if len(u) != len(v): return None
-        for u_, v_ in zip(u, v):
-            env = unify(u_, v_, env)
-        return env
+def unify(u : Term, v : Term, env : Env = dict()) -> Mapping:
+    if env is None: return env
     u = walk(u, env)
     v = walk(v, env)
-    if u == v:              return env    
-    if isinstance(u, Var):  return {u : v, **env}
-    if isinstance(v, Var):  return {v : u, **env}
-    else:                   return None
+    if u == v: return env
+    match (u, v):
+        case (Var(_), _): return {u : v, **env}
+        case (_, Var(_)): return {v : u, **env}
+        case (Relation(), Relation()):
+            if len(u) != len(v): return None
+            for x, y in zip(u, v):
+                env = unify(x, y, env)
+            return env
+        case _: return None
 
-def query(u : Term, topLevel : List[Rule], env = dict()):
-    """
-    if there is a result, yield env else return None
-    """
-    for i in topLevel:
-        e = unify(u, i.term, env)
+def query(u : Term, topLevel : TopLevel, env : Env = dict()):
+    for r in topLevel:
+        rule = changeName(r)
+        e = unify(u, rule.term, env)
         if e is not None:
-            yield from match(i.body, e, topLevel)
+            yield from match(rule.body, e, topLevel)
 
-# check if a predicate is true in current env
-# if is true yield env
-def match(pred : Predicate, env, topLevel):
-    if isinstance(pred, Top):    yield env
-    elif isinstance(pred, Just): yield from query(pred.body, topLevel, env)
-    elif isinstance(pred, Conj):
-        if len(pred.clauses) == 1:
-            yield from match(pred.clauses[0], env, topLevel)
-        else:
-            for e in match(pred.clauses[0], env, topLevel):
-                yield from match(Conj(pred.clauses[1:]), e, topLevel)
-    elif isinstance(pred, Disj):
-        for _pred in pred.clauses:
-            e = match(_pred, env, topLevel)
-            if e is not None: yield e
-    elif isinstance(pred, Not):
-        temp = match(pred.body, topLevel, env)
-        if temp is not None: return None
-        else:                return env
+def match(pred : Predicate, env : Env, topLevel : TopLevel):
+    match pred:
+        case Top():          yield env
+        case Just(body):     yield from query(body, topLevel, env)
+        case Conj([clause]): yield from match(clause, env, topLevel)
+        case Conj([clause, *clauses]):
+            for e in match(clause, env, topLevel):
+                yield from match(Conj(clauses), e, topLevel)
+        case Disj(clauses):
+            for clause in clauses:
+                if (e := match(clause, env, topLevel)) is not None:
+                    yield e
+        case Not(body):
+            if match(body, env, topLevel) is not None: return None
+            else:                                      yield env
+
+def driverLoop(u : Term, rules : TopLevel):
+    print("----------------------------------------------------")
+    match u:
+        case Var(x):     var = [Var(x)]
+        case Relation(): var = list(filter(lambda x: isinstance(x, Var), u))
+        case _         : var = []
+    if not var: # is empty
+        if next(query(u, rules)) is not None: print("yes")
+        else:                                 print("no")
+    else:
+        for env in query(u, rules):
+            print("env = ", env)
+            for v in var: print(v, "=", walk(v, env))
+            match input("input . to terminate, otherwise continue"):
+                case ".": break
+    print("\nterminated!\n")
 
 
 def testWalk():
-    assert (Const(10) ==
-        walk(Var(1), {Var(1) : Const(10)}))
-    assert (Const(10) ==
-        walk(Var(1), {Var(1) : Var(2), Var(2) : Const(10)}))
+    assert (Const(10) == walk(Var(1), {Var(1) : Const(10)}))
+    assert (Const(10) == walk(Var(1), {Var(1) : Var(2), Var(2) : Const(10)}))
 
 def testUnify():
     assert({Var(1) : Var(2), Var(2) : Const(10)} ==
         dict(unify(Relation(Var(1), Const(2)), Relation(Var(2), Var(2)))))
     assert({Var(2) : Relation(Const(2), Const(2)), Var(1) : Var(2)} ==
         dict(unify(Relation(Var(1), Relation(Const(2), Const(2))), Relation(Var(2), Var(2)))))
-    pass
 
-
-
-# def testQuery():
-#     r = Relation(Const("friend"), Const("Bob"), Var(1))
-#     rules = [
-#         Rule(Relation(Const("friend"), Const("Bob"), Const("Alice")), Top()),
-#         Rule(Relation(Const("friend"), Const("Charlie"), Const("Alice")), Top()),
-#         Rule(Relation(Const("friend"), Const("David"), Const("Bob")), Top()),
-#         # Rule(Relation(Const("friend"), Var(3), Var(4)), 
-#         #     Just(Relation(Const("friend"), Var(4), Var(3)))),
-#         Rule(Relation(Const("friend"), Var(5), Var(6)),
-#             Conj([
-#                 Just(Relation(Const("friend"), Var(5), Var(7))),
-#                 Just(Relation(Const("friend"), Var(7), Var(6)))
-#             ])),
-#         # Rule(Relation(Const("friend"), Const("Bob"), Var(2)), 
-#         #     Just(Relation(Const("friend"), Var(2), Const("Bob")))),
-#     ]
-#     for i in query(r, rules):
-#         print(i)
 
 # testQuery()
 MARY = Const("Mary")
@@ -153,7 +161,6 @@ def testQuery2():
     else:
         print("no")
 
-testQuery2()
 
 # family tree
 
@@ -208,22 +215,38 @@ def familyTree():
                 Just(Relation(Female, Var(2))),
             ])),
 
-        Rule(Relation(Father, Var(3), Var(4)), 
+        Rule(Relation(Father, Var(1), Var(2)), 
             Conj([
-                Just(Relation(Parent, Var(3), Var(4))),
-                Just(Relation(Male, Var(4))),
+                Just(Relation(Parent, Var(1), Var(2))),
+                Just(Relation(Male, Var(2))),
             ]))
     ]
-    for _ in query(Relation(Father, CharlesI, JamesI), rules):
-        print("yes")
-        break
-    else:
-        print("no")
-    for i in query(Relation(Father, Var(5), CharlesI), rules):
-        print(i)
-    for i in query(Relation(Father, Var(6), Var(7)), rules):
-        print(i)
+    driverLoop(Relation(Father, CharlesI, JamesI), rules)
+    driverLoop(Relation(Father, Var(1), CharlesI), rules)
+    driverLoop(Relation(Father, Var(1), Var(2)), rules)
     
-familyTree()
+# familyTree()
+
+Nat = Const("Nat")
+Z = Const("Z")
+S = Const("S")
+
+Add = Const("add")
+
+def pianoNumbers():
+    rules = [
+        Rule(Relation(Nat, Z), Top()),
+        Rule(Relation(Nat, Relation(S, Var(1))), Top()),
+        Rule(Relation(Add, Z, Var(1), Var(1)), Top()),
+        Rule(Relation(Add, Relation(S, Var(1)), Var(2), Var(3)), 
+            Conj([
+                Just(Relation(Nat, Var(3))),
+                Just(Relation(Add, Var(1), Relation(S, Var(2)), Var(3)))])),
+    ]
+    driverLoop(Relation(Add, Z, Relation(S, Z), Relation(S, Z)), rules)
+    driverLoop(Relation(Add, Relation(S, Z), Relation(S, Z), Relation(S, Relation(S ,Z))), rules)
+    # driverLoop(Relation(Add, Var(1), Var(2), Relation(S, Relation(S ,Z))), rules)
+    driverLoop(Relation(Add, Var(1), Var(2), Var(3)), rules)
 
 
+pianoNumbers()
